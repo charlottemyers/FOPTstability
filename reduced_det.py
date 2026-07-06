@@ -24,6 +24,9 @@ def _core_acoustic(bg, L, alpha, xi_min=1e-3, rtol=1e-10, atol=1e-13):
         f = s*xi^l,  g = (-l/w)*xi^(l-1),  V = (-1/w)*xi^(l-1)
     Finite at the resonance s=0, where the acoustic column becomes
     parallel to the vorticity column (spurious zero of D at alpha=l-1;
+    ** remember** this happens at alpha = ell -1 since s = alpha - (l-1) = 0, so the first component -> 0,
+    just as it is in the vorticity branch (f = 0, g = xi^alpha, V = (alpha+2)/(l(l+1)) xi^alpha).
+    so the columns become parallel at this point
 
     ( recall there is also the vortical mode, but it is closed form so doesn't need to be integrated up)
 
@@ -35,16 +38,20 @@ def _core_acoustic(bg, L, alpha, xi_min=1e-3, rtol=1e-10, atol=1e-13):
 
     # RHS uses the interior-at-rest core state (w=wm, v=0, g=1)
     def rhs(xi, Y):
+        # Y = [f.real, g.real, V.real, f.imag, g.imag, V.imag], treat as real for solve_ivp
         y = Y[:3] + 1j*Y[3:]
         f, g, V = y
         Vp = (alpha/xi)*V + f/(xi**2*w)
         gp = (3*alpha*f + 3*xi*w*alpha*g + (2*w/xi)*g - (w/xi)*l*(l+1)*V) / (w*(3*xi**2 - 1.0))
         fp = xi*w*gp - w*alpha*g
         d = np.array([fp, gp, Vp])
+        # return derivatives of the core variables (f,g,V) at xi, as a real array for solve_ivp
         return np.concatenate([d.real, d.imag])
 
     # seed the Frobenius branch at xi_min (s-SCALED, so finite at s=0); these give the initial
     # conditions for the ODE integration from xi_min to xi_w
+    # **remember** that the overall scale of the solution doesn't matter,
+    # only the direction in (f,g,V) space
     y0 = np.array([s*xi_min**l, (-l/w)*xi_min**(l-1), (-1.0/w)*xi_min**(l-1)], dtype=complex)
     Y0 = np.concatenate([y0.real, y0.imag])
     sol = solve_ivp(rhs, (xi_min, xi_w), Y0, t_eval=[xi_w], rtol=rtol, atol=atol, method='RK45')
@@ -56,8 +63,10 @@ EPS_BG = 1e-7   # one-sided offset for evaluating shell splines at surfaces#
 
 
 def _shell_rhs(xi, y, bg, L, alpha):
-    """Shell bulk ODE (f',g',V') from the VALIDATED equations
-    (xi OUTSIDE the time-derivative; translation-mode residuals ~1e-9)."""
+    """
+    Shell bulk ODE (f',g',V') from the VALIDATED equations
+    (xi OUTSIDE the time-derivative; translation-mode residuals ~1e-9).
+    """
     f, g, V = y
     S = _state(bg, xi)
     v, w, gm = S['v'], S['w'], S['g']
@@ -226,6 +235,8 @@ def shell_arrival(bg, L, alpha, y_shock, n_seg=8, rtol=1e-9, atol=1e-12):
     y = np.asarray(y_shock, dtype=complex)
     y = y / max(np.max(np.abs(y)), 1e-300)
     def rrhs(t, Y):
+        # rrhs = real rhs
+        # Y = [f.real, g.real, V.real, f.imag, g.imag, V.imag]
         yc = Y[:3] + 1j*Y[3:]
         d = np.asarray(_shell_rhs(t, yc, bg, L, alpha), dtype=complex)
         return np.concatenate([d.real, d.imag])
@@ -243,6 +254,8 @@ def shell_arrival(bg, L, alpha, y_shock, n_seg=8, rtol=1e-9, atol=1e-12):
 # core columns
 # ----------------------------------------------------------------------
 def core_columns(bg, L, alpha):
+    # get the core acoustic column (f, g, V) at the wall, unit-normalized
+    # the amplitude is what we solve for in the wall system
     ac = _core_acoustic(bg, L, alpha)                 # acoustic (integrated)
     ac = ac / max(np.max(np.abs(ac)), 1e-300)
     xw = bg['xi_w']
@@ -268,12 +281,14 @@ def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
 
     xi = bg['xi_w']
 
-    #Sp = plus state (just outside the wall, shell side);
+    # Sp = plus state (just outside the wall, shell side);
     # Sm = minus state (just inside the wall, core side)
     Sp = _state(bg, xi + EPS_BG)      # shell (+) side of the wall
     Sm = _state_core(bg)              # core  (-) side
 
     # get the core columns (acoustic, vortical) = (f_ac, g_ac, V_ac), (f_vort, g_vort, V_vort) at the wall
+    # these columns are returned with arbitrary normalization;  the amplitudes are exactly the free coefficients
+    # that we are trying to solve for, since they form 2 of the unknowns in the wall system
     ac, vort = core_columns(bg, L, alpha)
 
     # get the null vector of the shock system (f, g, V, k_sh)
@@ -282,12 +297,14 @@ def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
     sh = shell_arrival(bg, L, alpha, null[:3], n_seg=n_seg, rtol=rtol)
 
     def row(K):
+        # K = one of 'TE', 'RE', 'PE', 'ENT'; each is a junction equation at the wall
         kp, km = _kap(Sp, K, xi), _kap(Sm, K, xi)
         ma_p, m0_p = _mu(Sp, K, xi)
         ma_m, m0_m = _mu(Sm, K, xi)
         ck = alpha*(ma_p - ma_m) + (m0_p - m0_m)
         return np.array([-(km @ ac), -(km @ vort), (kp @ sh), ck], dtype=complex)
 
+    # rows of the 4x4 wall system (TE, RE, PE, ENT)
     rTE, rRE, rPE, rENT = row('TE'), row('RE'), row('PE'), row('ENT')
     if sub:
         lam_p = Sp['g']*Sp['T']
@@ -325,13 +342,14 @@ def scan_real(bg, L, alphas, **kw):
     return np.array([dispersion(bg, L, a + 0j, **kw)[0] for a in alphas])
 
 def winding(bg, L, z0, z1, n=200, **kw):
-    """number of zeros of D inside the rectangle with corners z0, z1
+    """
+    number of zeros of D inside the rectangle with corners z0, z1
     (cauchy's argument principle; D assumed nonzero on the contour).
     rememeber cauchy's arg principle: if $D$ has $N_z$ zeros and $N_p$ poles
       inside the contour, the total phase accumulated is exactly $2\pi(N_z - N_p)$
     """
 
-    # build the rectangle contour in the complex plane, clockwise from z0 to z1
+    # build the rectangle contour in the complex plane, counterclockwise from z0 to z1
     x0, x1 = sorted((z0.real, z1.real)); y0, y1 = sorted((z0.imag, z1.imag))
     pts = np.concatenate([
         x0 + np.linspace(0, 1, n)*(x1 - x0) + 1j*y0,
@@ -469,6 +487,9 @@ def eigenvector(bg, L, alpha, n_core=200, n_shell=200, rtol=1e-9, sub = False):
                           xi_c**alpha,
                           (alpha+2.0)/(L*(L+1.0)) * xi_c**alpha], axis=1)
     vort_prof = vort_prof / max(np.max(np.abs(vort_prof[-1])), 1e-300)
+
+    # remember: the physical core solution is A_ac * ac + A_vort* vort
+    # (we only solve for the amplitudes, the basis vectors are fixed by alpha and ell)
     U_core = A_ac*ac_prof + A_vort*vort_prof
 
     # shell profile: integrate from the shock null vector WITHOUT renormalizing
