@@ -28,7 +28,8 @@ def _core_acoustic(bg, L, alpha, xi_min=1e-3, rtol=1e-10, atol=1e-13):
     just as it is in the vorticity branch (f = 0, g = xi^alpha, V = (alpha+2)/(l(l+1)) xi^alpha).
     so the columns become parallel at this point
 
-    ( recall there is also the vortical mode, but it is closed form so doesn't need to be integrated up)
+    (recall there is also the vortical mode, but it is closed form (for deflagrations)
+     so it doesn't need to be integrated up)
 
     """
     w = float(bg['wm'])
@@ -72,6 +73,9 @@ def _shell_rhs(xi, y, bg, L, alpha):
     v, w, gm = S['v'], S['w'], S['g']
     vp, wp, gp = S['vp'], S['wp'], S['gp']
     l = float(L)
+
+
+    # now substitute the solution vector y into the conservation equations
     T1 = 4*gm**2 - 1;            T1p = 8*gm*gp
     T2 = 2*w*gm**4*v;            T2p = 2*(wp*gm**4*v + 4*w*gm**3*gp*v + w*gm**4*vp)
     T3 = 4*gm**2*v;              T3p = 8*gm*gp*v + 4*gm**2*vp
@@ -84,7 +88,14 @@ def _shell_rhs(xi, y, bg, L, alpha):
     AT = T3 - xi*T1;  BT = T4 - xi*T2
     AR = R3 - xi*T3;  BR = R4 - xi*T4
 
-    # timelike and radial bulk equations
+    # timelike and radial bulk equations; these can used to extract f' and g' based on
+    # the known values of f, g, V at xi.  The equations are linear in f' and g', so we can solve for them using Cramer's rule.
+
+    # use Cramer's rule to solve for f' and g' in terms of f, g, V using only 2 conservation equations (TE and RE).  The third equation (PE) is used to solve for V' in terms of f, g, V.
+    # The polar equation is first order so we can just solve for V' directly based on V and f instead of treating
+    # it with the matrix equation
+
+
     RT = (-alpha*F00 - (T3p - xi*T1p)*f - (T4p - xi*T2p)*g
           - (2.0/xi)*F0r + (l*(l+1)/xi)*T5*V)
     RR = (-alpha*F0r - (R3p - xi*T3p)*f - (R4p - xi*T4p)*g
@@ -253,14 +264,14 @@ def shell_arrival(bg, L, alpha, y_shock, n_seg=8, rtol=1e-9, atol=1e-12):
 # ----------------------------------------------------------------------
 # core columns
 # ----------------------------------------------------------------------
-def core_columns(bg, L, alpha):
+def core_columns(bg, L, alpha, xi_min = 1e-3):
     # get the core acoustic column (f, g, V) at the wall, unit-normalized
     # the amplitude is what we solve for in the wall system
-    ac = _core_acoustic(bg, L, alpha)                 # acoustic (integrated)
+    ac = _core_acoustic(bg, L, alpha, xi_min = xi_min)                 # acoustic (integrated)
     ac = ac / max(np.max(np.abs(ac)), 1e-300)
     xw = bg['xi_w']
 
-    # vortical mode is closed form, don't need to integrate
+    # vortical mode is closed form, don't need to integrate!!
     vort = np.array([0.0,
                      xw**alpha,
                      (alpha + 2.0)/(L*(L + 1.0)) * xw**alpha], dtype=complex)
@@ -275,7 +286,7 @@ def core_columns(bg, L, alpha):
 # ----------------------------------------------------------------------
 # the 4x4 wall system and the dispersion determinant
 # ----------------------------------------------------------------------
-def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
+def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False, xi_min = 1e-3):
     # 4 unknowns: core acoustic amplitude, core vorticity amplitude,
     # shell amplitude, wall ripple amplitude
 
@@ -289,12 +300,15 @@ def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
     # get the core columns (acoustic, vortical) = (f_ac, g_ac, V_ac), (f_vort, g_vort, V_vort) at the wall
     # these columns are returned with arbitrary normalization;  the amplitudes are exactly the free coefficients
     # that we are trying to solve for, since they form 2 of the unknowns in the wall system
-    ac, vort = core_columns(bg, L, alpha)
+    ac, vort = core_columns(bg, L, alpha, xi_min = xi_min)
 
     # get the null vector of the shock system (f, g, V, k_sh)
     # and then integrate inward to the wall (f, g, V) on the shell side
-    null, sv = shock_null_vector(bg, alpha)
-    sh = shell_arrival(bg, L, alpha, null[:3], n_seg=n_seg, rtol=rtol)
+    null, sv = shock_null_vector(bg, alpha) # null = (f, g, V, k_sh), 4 components
+    sh = shell_arrival(bg, L, alpha, null[:3], n_seg=n_seg, rtol=rtol) #truncate the shock ripple component, since we only need the shell side (f, g, V) at the wall
+    # this truncation is not losing any information since k_sh at the shock is not an independent free parameter:
+    # it's locked to the fluid fields (f, g, V) in fixed ratio by the three RH conditions.
+    # so k_sh isn't a separate unknown that got dropped; it's a dependent quantity, pinned to B through the null vector
 
     def row(K):
         # K = one of 'TE', 'RE', 'PE', 'ENT'; each is a junction equation at the wall
@@ -305,11 +319,12 @@ def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
         return np.array([-(km @ ac), -(km @ vort), (kp @ sh), ck], dtype=complex)
 
     # rows of the 4x4 wall system (TE, RE, PE, ENT)
+    # columns of the 4x4 wall system (core acoustic, core vortical, shell, wall ripple)
     rTE, rRE, rPE, rENT = row('TE'), row('RE'), row('PE'), row('ENT')
     if sub:
         lam_p = Sp['g']*Sp['T']
         lam_m = Sm['g']*Sm['T']
-        lam = 0.5*(lam_p + lam_m)                           # LTE: these agree; checked in selftest
+        lam = 0.5*(lam_p + lam_m)
         # given the ENT and TE rows are near-parallel, replace the TE row with a linear combination
         # of TE and ENT that is orthogonal to ENT
         M = np.vstack([rTE - lam*rENT, rRE, rPE, rENT])
@@ -318,6 +333,7 @@ def wall_matrix(bg, L, alpha, n_seg=8, rtol=1e-9, sub = False):
     info = dict(shock_sv=sv,
                 shell_arrival=sh, core_ac=ac, core_vort=vort, shock_null=null)
     return M, info
+
 
 def dispersion(bg, L, alpha, **kw):
     """
